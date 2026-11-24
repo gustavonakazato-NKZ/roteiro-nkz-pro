@@ -56,7 +56,7 @@ import {
 // CONFIGURAÇÃO DO FIREBASE E CONSTANTES DO APLICATIVO
 // ============================================================================
 
-const APP_VERSION = 'v1.3.6';
+const APP_VERSION = 'v1.3.7';
 const appId = 'roteiro-nkz-pro';
 
 const DEFAULT_FIREBASE_CONFIG = {
@@ -781,6 +781,84 @@ async function verifyUserPassword(userRecord, inputPwd) {
 // INTEGRAÇÃO COM A API DO GEMINI (v3.5-flash-lite + FALLBACK AUTOMÁTICO)
 // ============================================================================
 
+async function fetchWithTimeout(url, options, timeoutMs = 35000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractGeminiTextParts(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  const nonThought = parts
+    .filter((p) => !p?.thought && typeof p?.text === 'string')
+    .map((p) => p.text)
+    .join('')
+    .trim();
+  if (nonThought) return nonThought;
+  return parts
+    .map((p) => (typeof p?.text === 'string' ? p.text : ''))
+    .join('')
+    .trim();
+}
+
+function normalizeGeneratedTrip(parsed, fallbackOrigin = '', fallbackDest = '') {
+  if (!parsed || !Array.isArray(parsed.days) || parsed.days.length === 0) return null;
+
+  const days = parsed.days.map((d, dIdx) => {
+    const dayNum = Number(d?.day) || dIdx + 1;
+    const rawStops = Array.isArray(d?.stops) ? d.stops : [];
+    const stops = rawStops.map((s, sIdx) => ({
+      id: s?.id || `d${dayNum}-s${sIdx + 1}-${Date.now()}`,
+      stopType: String(s?.stopType || 'Parada'),
+      arrival: String(s?.arrival || '08:00'),
+      departure: String(s?.departure || s?.arrival || '08:30'),
+      route: String(s?.route || `Ponto ${sIdx + 1}`),
+      activity: String(s?.activity || 'Parada programada no roteiro'),
+      km: Number(s?.km) || 0,
+      driveTime: String(s?.driveTime || '0:00'),
+      toll: Number(s?.toll) || 0,
+      roadInfo: String(s?.roadInfo || ''),
+      mapsQuery: String(s?.mapsQuery || s?.route || '')
+    }));
+
+    return {
+      day: dayNum,
+      date: String(d?.date || `Dia ${dayNum}`),
+      label: String(d?.label || `Dia ${dayNum}`),
+      subtitle: String(d?.subtitle || `${fallbackOrigin || 'Origem'} → ${fallbackDest || 'Destino'}`),
+      totalKm: Number(d?.totalKm) || stops.reduce((acc, st) => acc + (Number(st.km) || 0), 0),
+      totalDriveTime: String(d?.totalDriveTime || '0:00'),
+      totalTolls: Number(d?.totalTolls) || stops.reduce((acc, st) => acc + (Number(st.toll) || 0), 0),
+      stops
+    };
+  });
+
+  const lodgingCities = Array.isArray(parsed.lodgingCities)
+    ? parsed.lodgingCities.map((l, idx) => ({
+        id: l?.id || `lodg-${idx + 1}-${Date.now()}`,
+        city: String(l?.city || 'Hospedagem'),
+        nights: Math.max(1, Number(l?.nights) || 1),
+        dailyRate: Math.max(0, Number(l?.dailyRate) || 400)
+      }))
+    : [];
+
+  return {
+    name: String(parsed.name || `${fallbackOrigin || 'Origem'} ↔ ${fallbackDest || 'Destino'}`),
+    dateLabel: String(parsed.dateLabel || 'Personalizado'),
+    summary: String(parsed.summary || ''),
+    roundTrip: Boolean(parsed.roundTrip),
+    totalKm: Number(parsed.totalKm) || days.reduce((acc, d) => acc + (Number(d.totalKm) || 0), 0),
+    totalTolls: Number(parsed.totalTolls) || days.reduce((acc, d) => acc + (Number(d.totalTolls) || 0), 0),
+    lodgingCities,
+    days
+  };
+}
+
 async function callGeminiCopilot({ apiKey, systemPrompt, userPrompt, useSearch = false }) {
   const cleanKey = (apiKey || '').trim();
   if (!cleanKey) {
@@ -805,20 +883,24 @@ async function callGeminiCopilot({ apiKey, systemPrompt, userPrompt, useSearch =
       const body = {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-        generationConfig: { temperature: 0.4 }
+        generationConfig: { temperature: 0.4, maxOutputTokens: 2048 }
       };
       if (attempt.search) {
         body.tools = [{ google_search: {} }];
       }
 
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': cleanKey
+      const response = await fetchWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': cleanKey
+          },
+          body: JSON.stringify(body)
         },
-        body: JSON.stringify(body)
-      });
+        30000
+      );
 
       const data = await response.json();
       if (!response.ok) {
@@ -826,24 +908,23 @@ async function callGeminiCopilot({ apiKey, systemPrompt, userPrompt, useSearch =
         continue;
       }
 
-      const text = data?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text || '')
-        .join('')
-        .trim();
-
+      const text = extractGeminiTextParts(data);
       if (text) {
         return { ok: true, text, model: attempt.model };
       }
       lastError = 'O Gemini retornou uma resposta vazia.';
     } catch (err) {
-      lastError = err?.message || 'Erro de rede ao consultar o Gemini.';
+      lastError =
+        err?.name === 'AbortError'
+          ? 'Tempo limite excedido ao consultar o Gemini.'
+          : err?.message || 'Erro de rede ao consultar o Gemini.';
     }
   }
 
   return { ok: false, error: lastError };
 }
 
-async function callGeminiRouteBuilder({ apiKey, promptText }) {
+async function callGeminiRouteBuilder({ apiKey, promptText, origin = '', destination = '' }) {
   const cleanKey = (apiKey || '').trim();
   if (!cleanKey) {
     return {
@@ -853,7 +934,8 @@ async function callGeminiRouteBuilder({ apiKey, promptText }) {
   }
 
   const systemPrompt = `Você é um planejador rodoviário especialista em viagens pelo Brasil e América do Sul.
-Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, sem texto antes ou depois) seguindo exatamente esta estrutura:
+Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, sem texto antes ou depois).
+Seja conciso nos textos (2 a 4 paradas por dia) para garantir um JSON completo e rápido, seguindo exatamente esta estrutura:
 {
   "name": "Origem ↔ Destino",
   "dateLabel": "Mês/Ano",
@@ -880,11 +962,11 @@ Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, se
           "arrival": "07:00",
           "departure": "07:30",
           "route": "Cidade ou Ponto",
-          "activity": "Descrição prática da parada",
+          "activity": "Descrição prática curta",
           "km": 250,
           "driveTime": "3:15",
           "toll": 20.0,
-          "roadInfo": "Dica de estrada, radar ou segurança",
+          "roadInfo": "Dica curta de estrada",
           "mapsQuery": "Consulta exata para Google Maps"
         }
       ]
@@ -892,27 +974,42 @@ Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, se
   ]
 }`;
 
-  const models = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-flash-latest'];
+  const attempts = [
+    { model: 'gemini-3.5-flash-lite', jsonMode: true },
+    { model: 'gemini-3.5-flash-lite', jsonMode: false },
+    { model: 'gemini-3.5-flash', jsonMode: true },
+    { model: 'gemini-flash-latest', jsonMode: true }
+  ];
+
   let lastError = 'Não foi possível gerar o roteiro.';
 
-  for (const model of models) {
+  for (const attempt of attempts) {
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(cleanKey)}`;
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': cleanKey
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${attempt.model}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+      const generationConfig = {
+        temperature: 0.3,
+        maxOutputTokens: 8192
+      };
+      if (attempt.jsonMode) {
+        generationConfig.responseMimeType = 'application/json';
+      }
+
+      const response = await fetchWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': cleanKey
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ role: 'user', parts: [{ text: promptText }] }],
+            generationConfig
+          })
         },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ role: 'user', parts: [{ text: promptText }] }],
-          generationConfig: {
-            temperature: 0.35,
-            responseMimeType: 'application/json'
-          }
-        })
-      });
+        35000
+      );
 
       const data = await response.json();
       if (!response.ok) {
@@ -920,11 +1017,7 @@ Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, se
         continue;
       }
 
-      const rawText = data?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text || '')
-        .join('')
-        .trim();
-
+      const rawText = extractGeminiTextParts(data);
       if (!rawText) {
         lastError = 'Resposta vazia do Gemini.';
         continue;
@@ -936,13 +1029,26 @@ Responda EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem crases, se
         .replace(/```$/i, '')
         .trim();
 
-      const parsed = JSON.parse(cleaned);
-      if (parsed && Array.isArray(parsed.days) && parsed.days.length > 0) {
-        return { ok: true, trip: parsed };
+      const firstBrace = cleaned.indexOf('{');
+      const lastBrace = cleaned.lastIndexOf('}');
+      if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+        lastError = 'A resposta do Gemini não veio em formato JSON válido.';
+        continue;
+      }
+
+      const jsonSlice = cleaned.slice(firstBrace, lastBrace + 1);
+      const parsed = JSON.parse(jsonSlice);
+      const normalized = normalizeGeneratedTrip(parsed, origin, destination);
+
+      if (normalized) {
+        return { ok: true, trip: normalized, model: attempt.model };
       }
       lastError = 'O JSON retornado não continha os dias da viagem.';
     } catch (err) {
-      lastError = err?.message || 'Erro ao interpretar a resposta do Gemini.';
+      lastError =
+        err?.name === 'AbortError'
+          ? 'Tempo limite excedido (35s). Tente gerar com menos dias ou tente novamente.'
+          : err?.message || 'Erro ao interpretar a resposta do Gemini.';
     }
   }
 
@@ -1898,7 +2004,8 @@ export default function App() {
     setRouteLoading(true);
     setRouteError(null);
 
-    const promptText = `Crie um roteiro rodoviário detalhado:
+    try {
+      const promptText = `Crie um roteiro rodoviário detalhado:
 - Origem: ${routeBuilderForm.origin}
 - Destino: ${routeBuilderForm.destination}
 - Data de início: ${routeBuilderForm.startDate || 'A definir'}
@@ -1906,17 +2013,27 @@ export default function App() {
 - Tipo: ${routeBuilderForm.roundTrip ? 'Ida e Volta' : 'Somente Ida'}
 - Preferências / Observações: ${routeBuilderForm.preferences || 'Paradas seguras, restaurantes bem avaliados e divisão equilibrada de quilometragem por dia.'}`;
 
-    const res = await callGeminiRouteBuilder({
-      apiKey: effectiveGeminiApiKey,
-      promptText
-    });
+      const res = await callGeminiRouteBuilder({
+        apiKey: effectiveGeminiApiKey,
+        promptText,
+        origin: routeBuilderForm.origin.trim(),
+        destination: routeBuilderForm.destination.trim()
+      });
 
-    setRouteLoading(false);
-    if (!res.ok) {
-      setRouteError(res.error);
-      return;
+      if (!res.ok) {
+        setRouteError(res.error);
+        showToast('Erro ao gerar roteiro. Veja o detalhe na tela.', 'error');
+        return;
+      }
+      setDraftTrip(res.trip);
+      showToast('Roteiro gerado pelo Gemini! Revise e salve.');
+    } catch (err) {
+      const msg = err?.message || 'Erro inesperado ao gerar roteiro.';
+      setRouteError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setRouteLoading(false);
     }
-    setDraftTrip(res.trip);
   };
 
   const handleAdjustDraftWithGemini = async () => {
@@ -1924,25 +2041,33 @@ export default function App() {
     setRouteLoading(true);
     setRouteError(null);
 
-    const promptText = `Ajuste o roteiro JSON abaixo conforme a solicitação do viajante, mantendo toda a estrutura JSON válida:
+    try {
+      const promptText = `Ajuste o roteiro JSON abaixo conforme a solicitação do viajante, mantendo toda a estrutura JSON válida:
 SOLICITAÇÃO: ${adjustmentText}
 
 ROTEIRO ATUAL:
 ${JSON.stringify(draftTrip)}`;
 
-    const res = await callGeminiRouteBuilder({
-      apiKey: effectiveGeminiApiKey,
-      promptText
-    });
+      const res = await callGeminiRouteBuilder({
+        apiKey: effectiveGeminiApiKey,
+        promptText
+      });
 
-    setRouteLoading(false);
-    if (!res.ok) {
-      setRouteError(res.error);
-      return;
+      if (!res.ok) {
+        setRouteError(res.error);
+        showToast('Erro ao ajustar roteiro. Veja o detalhe na tela.', 'error');
+        return;
+      }
+      setDraftTrip(res.trip);
+      setAdjustmentText('');
+      showToast('Roteiro ajustado pelo Gemini! Revise e clique em Salvar.');
+    } catch (err) {
+      const msg = err?.message || 'Erro inesperado ao ajustar roteiro.';
+      setRouteError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setRouteLoading(false);
     }
-    setDraftTrip(res.trip);
-    setAdjustmentText('');
-    showToast('Roteiro ajustado pelo Gemini! Revise e clique em Salvar.');
   };
 
   const handleSaveDraftTrip = () => {
