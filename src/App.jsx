@@ -72,7 +72,7 @@ let fbApp = null;
 let fbAuth = null;
 let fbDb = null;
 const appId = 'roteiro-nkz-pro';
-const APP_VERSION = 'v1.2.2';
+const APP_VERSION = 'v1.2.3';
 
 try {
   let firebaseConfig = DEFAULT_FIREBASE_CONFIG;
@@ -970,6 +970,20 @@ const calcHaversineKm = (lat1, lng1, lat2, lng2) => {
   return R * c;
 };
 
+const calcBearingDirection = (lat1, lng1, lat2, lng2) => {
+  if ([lat1, lng1, lat2, lng2].some((v) => v === null || v === undefined || isNaN(v))) return '';
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const toDeg = (rad) => (rad * 180) / Math.PI;
+  const dLng = toRad(lng2 - lng1);
+  const y = Math.sin(dLng) * Math.cos(toRad(lat2));
+  const x =
+    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
+  const bearing = (toDeg(Math.atan2(y, x)) + 360) % 360;
+  const dirs = ['Norte', 'Nordeste', 'Leste', 'Sudeste', 'Sul', 'Sudoeste', 'Oeste', 'Noroeste'];
+  return dirs[Math.round(bearing / 45) % 8];
+};
+
 const formatBRL = (val) => {
   const num = Number(val) || 0;
   return num.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -1360,6 +1374,7 @@ export default function App() {
   });
   const [showLoginFbSetup, setShowLoginFbSetup] = useState(false);
   const isRemoteUpdateRef = useRef(false);
+  const lastGpsWatchRef = useRef(0);
 
   // GPS em tempo real
   const [gps, setGps] = useState({ lat: null, lng: null, accuracy: null, updatedAt: null, loading: false, error: null });
@@ -1720,6 +1735,35 @@ export default function App() {
     checklist
   ]);
 
+  // Rastreamento GPS contínuo automático enquanto estiver conectado na sala do Comboio
+  useEffect(() => {
+    if (!convoyConnected || !navigator.geolocation) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const nowTs = Date.now();
+        if (nowTs - lastGpsWatchRef.current < 5000) return;
+        lastGpsWatchRef.current = nowTs;
+        setGps({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: Math.round(pos.coords.accuracy || 0),
+          updatedAt: getCurrentHHMM(),
+          loading: false,
+          error: null
+        });
+      },
+      () => {
+        setGps((prev) => ({
+          ...prev,
+          loading: false,
+          error: 'Permissão de GPS negada ou sinal indisponível.'
+        }));
+      },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [convoyConnected]);
+
   // Escutar veículos na sala do Comboio (Firestore)
   useEffect(() => {
     if (!fbDb || !fbUser || !convoyConnected || !convoyRoom.trim()) return;
@@ -1748,14 +1792,15 @@ export default function App() {
       setSimVehicles([]);
       return;
     }
-    const baseLat = gps.lat || -26.8500;
-    const baseLng = gps.lng || -51.1200;
+    const baseLat = gps.lat ?? -26.8500;
+    const baseLng = gps.lng ?? -51.1200;
     setSimVehicles([
       {
         id: 'sim-car-2',
         vehicleName: 'Família Silva',
         ownerName: 'Família Silva',
         ownerUsername: 'silva',
+        hasGps: true,
         lat: baseLat + 0.095,
         lng: baseLng + 0.042,
         speedKmh: 92,
@@ -1771,6 +1816,7 @@ export default function App() {
         vehicleName: 'Amigos',
         ownerName: 'Amigos',
         ownerUsername: 'amigos',
+        hasGps: true,
         lat: baseLat - 0.068,
         lng: baseLng - 0.031,
         speedKmh: 84,
@@ -1808,12 +1854,12 @@ export default function App() {
     });
   }, [currentUser?.name]);
 
-  // Publicar minha posição/gastos na sala Firebase quando conectado
+  // Publicar minha posição GPS REAL e gastos na sala Firebase quando conectado
   useEffect(() => {
     if (!fbDb || !fbUser || !convoyConnected || !convoyRoom.trim()) return;
 
     const myRef = doc(fbDb, 'artifacts', appId, 'public', 'data', 'convoy_members', fbUser.uid);
-    const refCoords = gps.lat && gps.lng ? { lat: gps.lat, lng: gps.lng } : REFERENCE_POINTS[refPointKey];
+    const hasRealGps = gps.lat !== null && gps.lng !== null;
 
     setDoc(
       myRef,
@@ -1822,9 +1868,10 @@ export default function App() {
         vehicleName: vehicleName.trim() || currentUser?.name || currentUser?.username || 'Meu Veículo',
         ownerName: currentUser?.name || vehicleName.trim() || 'Motorista',
         ownerUsername: currentUser?.username || '',
-        lat: refCoords.lat,
-        lng: refCoords.lng,
-        updatedAt: getCurrentHHMM(),
+        hasGps: hasRealGps,
+        lat: hasRealGps ? gps.lat : null,
+        lng: hasRealGps ? gps.lng : null,
+        updatedAt: gps.updatedAt || getCurrentHHMM(),
         shareExpenses: Boolean(shareExpenses),
         totalSpent: shareExpenses ? Number(budget.totalRealized.toFixed(2)) : 0,
         travelers: Number(params.travelers) || 1,
@@ -1844,12 +1891,12 @@ export default function App() {
     currentUser?.username,
     gps.lat,
     gps.lng,
+    gps.updatedAt,
     shareExpenses,
     budget.totalRealized,
     params.travelers,
     selectedDay,
-    expenses,
-    refPointKey
+    expenses
   ]);
 
   // ============================================================================
@@ -2248,6 +2295,7 @@ export default function App() {
     setGps((prev) => ({ ...prev, loading: true, error: null }));
     navigator.geolocation.getCurrentPosition(
       (pos) => {
+        lastGpsWatchRef.current = Date.now();
         setGps({
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
@@ -3030,7 +3078,13 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
   };
 
   const renderComboioTab = () => {
-    const myCoords = gps.lat && gps.lng ? { lat: gps.lat, lng: gps.lng } : REFERENCE_POINTS[refPointKey];
+    const hasMyRealGps = gps.lat !== null && gps.lng !== null;
+    const myCoords = hasMyRealGps
+      ? { lat: gps.lat, lng: gps.lng }
+      : simMode
+      ? { lat: -26.8500, lng: -51.1200 }
+      : null;
+
     const otherVehicles = simMode
       ? simVehicles
       : convoyMembers.filter((m) => !fbUser || m.id !== fbUser.uid);
@@ -3045,7 +3099,7 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                 <Radio className="w-3.5 h-3.5" />
                 Radar de Comboio em Tempo Real
               </span>
-              <h2 className="text-sm font-extrabold mt-0.5">Acompanhar Veículos na Rota</h2>
+              <h2 className="text-sm font-extrabold mt-0.5">Distância Real Entre Veículos</h2>
             </div>
             <button
               onClick={handleShareConvoyInvite}
@@ -3086,6 +3140,7 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                 onClick={() => {
                   setConvoyError(null);
                   setConvoyConnected(true);
+                  if (!hasMyRealGps) handleUpdateGPS();
                   showToast(`Conectado à sala ${convoyRoom}!`);
                 }}
                 className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs transition"
@@ -3118,6 +3173,52 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
               {convoyError}
             </div>
           )}
+        </div>
+
+        {/* Status do Meu GPS Real (essencial para calcular distância entre veículos) */}
+        <div
+          className={`rounded-2xl p-3.5 shadow-sm border flex items-center justify-between gap-3 ${
+            hasMyRealGps
+              ? 'bg-emerald-50 border-emerald-200'
+              : 'bg-amber-50 border-amber-200'
+          }`}
+        >
+          <div className="min-w-0">
+            <div
+              className={`text-xs font-extrabold flex items-center gap-1.5 ${
+                hasMyRealGps ? 'text-emerald-900' : 'text-amber-900'
+              }`}
+            >
+              <Crosshair className="w-4 h-4 shrink-0" />
+              {hasMyRealGps
+                ? convoyConnected
+                  ? 'Seu GPS Real está ao vivo'
+                  : 'Seu GPS Real está ativo'
+                : 'Ative seu GPS para medir a distância até você'}
+            </div>
+            <div
+              className={`text-[11px] mt-0.5 truncate ${
+                hasMyRealGps ? 'text-emerald-700' : 'text-amber-800'
+              }`}
+            >
+              {hasMyRealGps
+                ? `${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)} • Atualizado às ${gps.updatedAt}`
+                : gps.error || 'Sem GPS ativo, não é possível calcular a distância real até os outros carros.'}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleUpdateGPS}
+            disabled={gps.loading}
+            className={`shrink-0 px-3 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition ${
+              hasMyRealGps
+                ? 'bg-emerald-700 hover:bg-emerald-800 text-white'
+                : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${gps.loading ? 'animate-spin' : ''}`} />
+            {gps.loading ? 'Lendo...' : hasMyRealGps ? 'Atualizar' : 'Ativar GPS'}
+          </button>
         </div>
 
         {/* Privacidade de Gastos */}
@@ -3170,15 +3271,39 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
             </div>
           ) : (
             otherVehicles.map((car) => {
-              const distKm = calcHaversineKm(myCoords.lat, myCoords.lng, car.lat, car.lng);
+              const carHasRealGps =
+                car.hasGps !== false &&
+                car.lat !== null &&
+                car.lat !== undefined &&
+                car.lng !== null &&
+                car.lng !== undefined;
+
+              const distKm =
+                myCoords && carHasRealGps
+                  ? calcHaversineKm(myCoords.lat, myCoords.lng, car.lat, car.lng)
+                  : null;
               const etaMin = distKm !== null ? Math.max(1, Math.round((distKm / 85) * 60)) : null;
+              const direction =
+                myCoords && carHasRealGps
+                  ? calcBearingDirection(myCoords.lat, myCoords.lng, car.lat, car.lng)
+                  : '';
+              const formattedDist =
+                distKm === null
+                  ? null
+                  : distKm < 1
+                  ? `${Math.round(distKm * 1000)} m`
+                  : `${formatNum(distKm, 1)} km`;
 
               return (
                 <div key={car.id} className="bg-white rounded-2xl p-4 shadow-sm border border-slate-200/80 space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <div>
                       <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            carHasRealGps ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'
+                          }`}
+                        />
                         <h4 className="text-sm font-bold text-slate-900">
                           {car.ownerName || car.vehicleName}
                         </h4>
@@ -3198,11 +3323,21 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                       </p>
                     </div>
 
-                    {distKm !== null && (
+                    {formattedDist !== null ? (
                       <div className="text-right shrink-0">
-                        <div className="text-sm font-extrabold text-teal-800">{formatNum(distKm, 1)} km</div>
-                        <div className="text-[10px] text-slate-500">~{etaMin} min de você</div>
+                        <div className="text-sm font-extrabold text-teal-800">{formattedDist}</div>
+                        <div className="text-[10px] font-semibold text-slate-500">
+                          de você • ~{etaMin} min{direction ? ` (${direction})` : ''}
+                        </div>
                       </div>
+                    ) : !myCoords ? (
+                      <span className="shrink-0 text-[10px] font-bold px-2 py-1 rounded-lg bg-amber-100 text-amber-800">
+                        Ative seu GPS
+                      </span>
+                    ) : (
+                      <span className="shrink-0 text-[10px] font-bold px-2 py-1 rounded-lg bg-slate-100 text-slate-600">
+                        Aguardando GPS
+                      </span>
                     )}
                   </div>
 
@@ -3220,13 +3355,19 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                     </div>
                   )}
 
-                  <button
-                    onClick={() => openGoogleMaps('route', `${car.lat},${car.lng}`)}
-                    className="w-full py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-bold flex items-center justify-center gap-1.5 transition"
-                  >
-                    <Navigation className="w-3.5 h-3.5" />
-                    Ver Localização no Google Maps
-                  </button>
+                  {carHasRealGps ? (
+                    <button
+                      onClick={() => openGoogleMaps('route', `${car.lat},${car.lng}`)}
+                      className="w-full py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-bold flex items-center justify-center gap-1.5 transition"
+                    >
+                      <Navigation className="w-3.5 h-3.5" />
+                      Traçar Rota até este Veículo (Maps)
+                    </button>
+                  ) : (
+                    <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl px-3 py-2">
+                      Este motorista entrou na sala, mas ainda precisa tocar em <strong>Ativar GPS</strong> no celular dele.
+                    </div>
+                  )}
                 </div>
               );
             })
