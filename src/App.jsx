@@ -37,7 +37,9 @@ import {
   MessageSquare,
   Search,
   Copy,
-  Radio
+  Radio,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
@@ -54,7 +56,7 @@ import {
 // CONFIGURAÇÃO DO FIREBASE E CONSTANTES DO APLICATIVO
 // ============================================================================
 
-const APP_VERSION = 'v1.3.2';
+const APP_VERSION = 'v1.3.5';
 const appId = 'roteiro-nkz-pro';
 
 const DEFAULT_FIREBASE_CONFIG = {
@@ -611,7 +613,7 @@ const EXPLORE_SPOTS = [
 ];
 
 // ============================================================================
-// FUNÇÕES AUXILIARES (FORMATAÇÃO, HORÁRIO, DISTÂNCIA GPS E DIREÇÃO)
+// FUNÇÕES AUXILIARES (FORMATAÇÃO, HORÁRIO, SENHAS, DISTÂNCIA GPS E DIREÇÃO)
 // ============================================================================
 
 function formatBRL(value) {
@@ -667,30 +669,112 @@ function getCardinalDirection(lat1, lng1, lat2, lng2) {
 // Normaliza registros de usuários vindos do Firebase ou localStorage (compatível com versões anteriores)
 function normalizeUserRecord(raw, fallbackId) {
   if (!raw || typeof raw !== 'object') return null;
-  const username = String(raw.username || raw.login || raw.user || fallbackId || '')
-    .trim()
-    .toLowerCase()
-    .replace(/^@/, '');
+  const rawUsername = raw.username ?? raw.login ?? raw.user ?? raw.usuario ?? fallbackId ?? '';
+  const username = String(rawUsername).trim().toLowerCase().replace(/^@/, '');
   if (!username) return null;
 
-  const password =
-    raw.password !== undefined
-      ? String(raw.password)
-      : raw.pass !== undefined
-      ? String(raw.pass)
-      : raw.senha !== undefined
-      ? String(raw.senha)
-      : '';
+  const explicitPwd = [raw.password, raw.pass, raw.senha, raw.pwd, raw.pin]
+    .find((v) => v !== undefined && v !== null && String(v).trim().length > 0);
+  const legacyHash = raw.passwordHash && String(raw.passwordHash).trim().length > 0
+    ? String(raw.passwordHash).trim()
+    : '';
 
   return {
     ...raw,
     id: raw.id || fallbackId || `user-${username}`,
     username,
-    name: raw.name || raw.nome || username,
-    password,
-    role: raw.role === 'admin' || raw.isAdmin === true ? 'admin' : 'user',
-    active: raw.active !== false && raw.blocked !== true && raw.status !== 'bloqueado'
+    name: String(raw.name ?? raw.nome ?? raw.displayName ?? username).trim(),
+    password: explicitPwd !== undefined ? String(explicitPwd) : legacyHash,
+    passwordHash: legacyHash,
+    hasLegacyHashOnly: explicitPwd === undefined && legacyHash.length > 0,
+    role: raw.role === 'admin' || raw.isAdmin === true || raw.perfil === 'admin' ? 'admin' : 'user',
+    active: raw.active !== false && raw.blocked !== true && raw.status !== 'bloqueado' && raw.status !== 'blocked'
   };
+}
+
+async function computeSha256Hex(text) {
+  try {
+    if (window.crypto && window.crypto.subtle) {
+      const data = new TextEncoder().encode(text);
+      const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  } catch (e) {}
+  return '';
+}
+
+function computeSimpleHashCandidates(text) {
+  const candidates = new Set();
+  let h = 0;
+  for (let i = 0; i < text.length; i++) {
+    h = (h << 5) - h + text.charCodeAt(i);
+    h |= 0;
+  }
+  const abs36 = Math.abs(h).toString(36);
+  const abs16 = Math.abs(h).toString(16);
+  const unsigned16 = (h >>> 0).toString(16);
+  const unsigned36 = (h >>> 0).toString(36);
+  candidates.add(abs36);
+  candidates.add(abs16);
+  candidates.add(unsigned16);
+  candidates.add(unsigned36);
+  candidates.add(`nkz_${abs36}`);
+  candidates.add(`nkz_${abs16}`);
+  candidates.add(`h_${abs36}`);
+  try {
+    candidates.add(window.btoa(text));
+    candidates.add(window.btoa(unescape(encodeURIComponent(text))));
+  } catch (e) {}
+  return Array.from(candidates);
+}
+
+async function verifyUserPassword(userRecord, inputPwd) {
+  if (!userRecord || !inputPwd) return false;
+  const pwd = String(inputPwd);
+  const pwdTrimmed = pwd.trim();
+
+  const storedValues = [
+    userRecord.password,
+    userRecord.pass,
+    userRecord.senha,
+    userRecord.pwd,
+    userRecord.pin,
+    userRecord.passwordHash
+  ]
+    .filter((v) => v !== undefined && v !== null && String(v).trim().length > 0)
+    .map((v) => String(v));
+
+  if (storedValues.length === 0) return false;
+
+  // 1. Comparação direta (texto simples ou hash colado diretamente)
+  for (const stored of storedValues) {
+    if (stored === pwd || stored === pwdTrimmed || stored.trim() === pwdTrimmed) {
+      return true;
+    }
+  }
+
+  // 2. Comparação com hashes comuns (SHA-256 completo/prefixo, Base64 e hashes simples)
+  const sha = await computeSha256Hex(pwd);
+  const shaTrimmed = pwdTrimmed !== pwd ? await computeSha256Hex(pwdTrimmed) : sha;
+  const simpleCandidates = new Set([
+    ...computeSimpleHashCandidates(pwd),
+    ...computeSimpleHashCandidates(pwdTrimmed)
+  ]);
+
+  for (const stored of storedValues) {
+    const cleanStored = stored.trim();
+    if (
+      (sha && (cleanStored === sha || sha.startsWith(cleanStored))) ||
+      (shaTrimmed && (cleanStored === shaTrimmed || shaTrimmed.startsWith(cleanStored))) ||
+      simpleCandidates.has(cleanStored)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // ============================================================================
@@ -897,6 +981,7 @@ export default function App() {
   });
 
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
 
   // Estado Firebase e Nuvem
@@ -959,6 +1044,8 @@ export default function App() {
   const [showPasswordChange, setShowPasswordChange] = useState(false);
   const [passwordForm, setPasswordForm] = useState({ current: '', next: '', confirm: '' });
   const [newUserForm, setNewUserForm] = useState({ name: '', username: '', password: '', role: 'user' });
+  const [resettingUserId, setResettingUserId] = useState(null);
+  const [resetPasswordValue, setResetPasswordValue] = useState('');
   const [confirmReset, setConfirmReset] = useState(false);
   const [showParamsEditor, setShowParamsEditor] = useState(true);
   const [newLodgingCity, setNewLodgingCity] = useState({ city: '', nights: 1, dailyRate: 480 });
@@ -1240,38 +1327,10 @@ export default function App() {
     if (!fbDb || !fbUser) return;
     const usersCol = collection(fbDb, 'artifacts', appId, 'public', 'data', 'app_users');
 
-    const normalizeUserRecord = (raw, fallbackId) => {
-      if (!raw || typeof raw !== 'object') return null;
-      const rawUsername = raw.username ?? raw.login ?? raw.user ?? raw.usuario ?? '';
-      const cleanUsername = String(rawUsername).trim();
-      if (!cleanUsername) return null;
-
-      const rawPwd =
-        raw.password ??
-        raw.pass ??
-        raw.senha ??
-        raw.pwd ??
-        raw.pin ??
-        raw.passwordHash ??
-        '';
-
-      return {
-        ...raw,
-        id: raw.id || fallbackId || `user-${cleanUsername.toLowerCase()}`,
-        username: cleanUsername,
-        name: String(raw.name ?? raw.nome ?? raw.displayName ?? cleanUsername).trim(),
-        password: rawPwd !== undefined && rawPwd !== null ? String(rawPwd) : '',
-        role: raw.role === 'admin' || raw.isAdmin === true || raw.perfil === 'admin' ? 'admin' : 'user',
-        active: raw.active !== false && raw.blocked !== true && raw.status !== 'blocked',
-        _rawKeys: Object.keys(raw)
-      };
-    };
-
     const unsub = onSnapshot(
       usersCol,
       (snap) => {
         if (snap.empty) {
-          // Semeia o admin padrão no primeiro acesso
           const defaultAdmin = DEFAULT_USERS[0];
           setDoc(doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_users', defaultAdmin.id), defaultAdmin).catch(() => {});
           setCloudStatus('synced');
@@ -1359,7 +1418,6 @@ export default function App() {
             if (Array.isArray(data.checklist)) setChecklist(data.checklist);
           }
         } else {
-          // Novo usuário sem workspace salvo: somente Admin inicia com o roteiro padrão
           const initialTripsForUser = currentUser.role === 'admin' ? DEFAULT_TRIPS : [];
           setTrips(initialTripsForUser);
           setActiveTripId(initialTripsForUser[0]?.id || '');
@@ -1534,12 +1592,11 @@ export default function App() {
   // AÇÕES DE LOGIN, SENHA, ADMIN E CONFIGURAÇÃO FIREBASE
   // ============================================================================
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError('');
     const uname = loginForm.username.trim().toLowerCase().replace(/^@/, '');
     const pwd = loginForm.password;
-    const pwdTrimmed = pwd.trim();
 
     if (!uname || !pwd) {
       setLoginError('Informe seu usuário e sua senha.');
@@ -1552,34 +1609,11 @@ export default function App() {
       return;
     }
 
-    let b64Pwd = '';
-    try {
-      b64Pwd = window.btoa(pwd);
-    } catch (err) {}
-
-    const candidatePasswords = [
-      found.password,
-      found.pass,
-      found.senha,
-      found.pwd,
-      found.pin,
-      found.passwordHash
-    ]
-      .filter((v) => v !== undefined && v !== null && String(v).length > 0)
-      .map((v) => String(v));
-
-    const passwordMatches = candidatePasswords.some(
-      (stored) =>
-        stored === pwd ||
-        stored === pwdTrimmed ||
-        stored.trim() === pwdTrimmed ||
-        (b64Pwd && stored === b64Pwd)
-    );
-
+    const passwordMatches = await verifyUserPassword(found, pwd);
     if (!passwordMatches) {
-      if (candidatePasswords.length === 0) {
+      if (found.hasLegacyHashOnly) {
         setLoginError(
-          `O cadastro de @${found.username} no Firebase está sem campo de senha reconhecido (campos encontrados: ${(found._rawKeys || []).join(', ')}).`
+          `Senha antiga (criptografada) para @${found.username}. Peça ao Admin para redefinir sua senha no Painel Admin.`
         );
       } else {
         setLoginError(`Senha incorreta para @${found.username}. Verifique letras maiúsculas/minúsculas.`);
@@ -1605,6 +1639,7 @@ export default function App() {
       setActiveTripId('');
     }
     setLoginForm({ username: '', password: '' });
+    setShowLoginPassword(false);
     showToast(`Bem-vindo, ${found.name}!`);
   };
 
@@ -1631,7 +1666,8 @@ export default function App() {
       showToast('Cadastro do usuário não localizado.', 'error');
       return;
     }
-    if (passwordForm.current !== myRecord.password) {
+    const currentOk = await verifyUserPassword(myRecord, passwordForm.current);
+    if (!currentOk) {
       showToast('A senha atual informada está incorreta.', 'error');
       return;
     }
@@ -1644,13 +1680,25 @@ export default function App() {
       return;
     }
 
-    const updatedUser = { ...myRecord, password: passwordForm.next };
+    const updatedUser = {
+      id: myRecord.id,
+      username: myRecord.username,
+      name: myRecord.name,
+      role: myRecord.role,
+      active: myRecord.active !== false,
+      password: passwordForm.next,
+      passwordHash: '',
+      hasLegacyHashOnly: false
+    };
     setAppUsers((prev) => prev.map((u) => (u.id === myRecord.id ? updatedUser : u)));
     if (fbDb && fbUser) {
       try {
         await setDoc(
           doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_users', myRecord.id),
-          updatedUser,
+          {
+            password: passwordForm.next,
+            passwordHash: ''
+          },
           { merge: true }
         );
       } catch (err) {}
@@ -1658,6 +1706,39 @@ export default function App() {
     setPasswordForm({ current: '', next: '', confirm: '' });
     setShowPasswordChange(false);
     showToast('Sua senha foi alterada com sucesso!');
+  };
+
+  const handleAdminResetPassword = async (userObj) => {
+    const newPwd = resetPasswordValue.trim();
+    if (newPwd.length < 4) {
+      showToast('Informe uma nova senha com pelo menos 4 caracteres.', 'error');
+      return;
+    }
+    const updatedUser = {
+      ...userObj,
+      password: newPwd,
+      passwordHash: '',
+      hasLegacyHashOnly: false
+    };
+    setAppUsers((prev) => prev.map((u) => (u.id === userObj.id ? updatedUser : u)));
+    if (fbDb && fbUser) {
+      try {
+        await setDoc(
+          doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_users', userObj.id),
+          {
+            password: newPwd,
+            passwordHash: ''
+          },
+          { merge: true }
+        );
+      } catch (err) {
+        showToast('Erro ao atualizar senha no Firebase.', 'error');
+        return;
+      }
+    }
+    setResettingUserId(null);
+    setResetPasswordValue('');
+    showToast(`Senha de @${userObj.username} redefinida com sucesso!`);
   };
 
   const handleCreateUser = async (e) => {
@@ -1677,6 +1758,7 @@ export default function App() {
       name: newUserForm.name.trim(),
       username: cleanUsername,
       password: newUserForm.password.trim(),
+      passwordHash: '',
       role: newUserForm.role === 'admin' ? 'admin' : 'user',
       active: true
     };
@@ -1709,7 +1791,7 @@ export default function App() {
       try {
         await setDoc(
           doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_users', userObj.id),
-          updated,
+          { active: updated.active },
           { merge: true }
         );
       } catch (e) {}
@@ -2387,14 +2469,24 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
 
             <div>
               <label className="block text-xs font-bold text-slate-700 mb-1">Senha</label>
-              <input
-                type="password"
-                autoComplete="current-password"
-                placeholder="Digite sua senha"
-                value={loginForm.password}
-                onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))}
-                className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm focus:outline-none focus:border-teal-600"
-              />
+              <div className="relative">
+                <input
+                  type={showLoginPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
+                  placeholder="Digite sua senha"
+                  value={loginForm.password}
+                  onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))}
+                  className="w-full rounded-xl border border-slate-200 pl-3.5 pr-10 py-2.5 text-sm focus:outline-none focus:border-teal-600"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowLoginPassword((v) => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"
+                  aria-label="Mostrar ou ocultar senha"
+                >
+                  {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
             </div>
 
             {loginError && (
@@ -4523,7 +4615,11 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                   <h2 className="text-base font-extrabold text-slate-900">Usuários & Chave Global</h2>
                 </div>
                 <button
-                  onClick={() => setShowAdminModal(false)}
+                  onClick={() => {
+                    setShowAdminModal(false);
+                    setResettingUserId(null);
+                    setResetPasswordValue('');
+                  }}
                   className="p-1.5 rounded-xl bg-slate-100 text-slate-600"
                 >
                   <X className="w-4 h-4" />
@@ -4612,32 +4708,74 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                 {appUsers.map((u) => (
                   <div
                     key={u.id}
-                    className="bg-white rounded-xl p-2.5 border border-slate-200 flex items-center justify-between gap-2"
+                    className="bg-white rounded-xl p-2.5 border border-slate-200 space-y-2"
                   >
-                    <div className="min-w-0">
-                      <div className="text-xs font-bold text-slate-900 truncate">
-                        {u.name}{' '}
-                        <span className="text-[10px] font-semibold text-slate-500">(@{u.username})</span>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-slate-900 truncate">
+                          {u.name}{' '}
+                          <span className="text-[10px] font-semibold text-slate-500">(@{u.username})</span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 flex items-center gap-1.5 flex-wrap">
+                          <span>{u.role === 'admin' ? 'Admin' : 'Usuário'}</span>
+                          <span>•</span>
+                          <span>{u.active === false ? 'Bloqueado' : 'Ativo'}</span>
+                          {u.hasLegacyHashOnly && (
+                            <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-bold text-[9px]">
+                              Redefinir senha
+                            </span>
+                          )}
+                        </div>
                       </div>
-                      <div className="text-[10px] text-slate-500">
-                        {u.role === 'admin' ? 'Admin' : 'Usuário'} •{' '}
-                        {u.active === false ? 'Bloqueado' : 'Ativo'}
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => {
+                            if (resettingUserId === u.id) {
+                              setResettingUserId(null);
+                              setResetPasswordValue('');
+                            } else {
+                              setResettingUserId(u.id);
+                              setResetPasswordValue('');
+                            }
+                          }}
+                          className="p-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700"
+                          title="Redefinir senha deste usuário"
+                        >
+                          <Key className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleToggleUserActive(u)}
+                          className="px-2 py-1 rounded-lg bg-slate-100 text-slate-700 text-[10px] font-bold"
+                        >
+                          {u.active === false ? 'Liberar' : 'Bloquear'}
+                        </button>
+                        <button
+                          onClick={() => handleDeleteUser(u)}
+                          className="p-1.5 text-slate-400 hover:text-rose-600"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        onClick={() => handleToggleUserActive(u)}
-                        className="px-2 py-1 rounded-lg bg-slate-100 text-slate-700 text-[10px] font-bold"
-                      >
-                        {u.active === false ? 'Liberar' : 'Bloquear'}
-                      </button>
-                      <button
-                        onClick={() => handleDeleteUser(u)}
-                        className="p-1.5 text-slate-400 hover:text-rose-600"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+
+                    {resettingUserId === u.id && (
+                      <div className="flex gap-1.5 pt-1 border-t border-slate-100">
+                        <input
+                          type="text"
+                          placeholder={`Nova senha para @${u.username}`}
+                          value={resetPasswordValue}
+                          onChange={(e) => setResetPasswordValue(e.target.value)}
+                          className="flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleAdminResetPassword(u)}
+                          className="px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-[11px] font-bold"
+                        >
+                          Salvar
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
