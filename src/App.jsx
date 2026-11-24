@@ -72,7 +72,7 @@ let fbApp = null;
 let fbAuth = null;
 let fbDb = null;
 const appId = 'roteiro-nkz-pro';
-const APP_VERSION = 'v1.2.1';
+const APP_VERSION = 'v1.2.2';
 
 try {
   let firebaseConfig = DEFAULT_FIREBASE_CONFIG;
@@ -1051,11 +1051,12 @@ async function callGeminiCopilot({ userPrompt, systemPrompt, customApiKey }) {
     throw new Error('Chave API do Gemini não informada nas Configurações.');
   }
 
-  // Tenta modelos estáveis com e sem Google Search (evita bloqueios na camada gratuita)
+  // Usa o modelo recomendado pelo Google (gemini-3.5-flash-lite) com fallbacks seguros
   const attempts = [
-    { model: 'gemini-2.5-flash', useSearch: true },
-    { model: 'gemini-2.5-flash', useSearch: false },
-    { model: 'gemini-2.5-flash-lite', useSearch: false }
+    { model: 'gemini-3.5-flash-lite', useSearch: true },
+    { model: 'gemini-3.5-flash-lite', useSearch: false },
+    { model: 'gemini-3.5-flash', useSearch: false },
+    { model: 'gemini-flash-latest', useSearch: false }
   ];
 
   let lastError = null;
@@ -1105,7 +1106,7 @@ async function callGeminiRouteBuilder({ form, currentDraft, adjustmentPrompt, cu
   if (!apiKey) {
     throw new Error('Chave API do Gemini não informada nas Configurações.');
   }
-  const modelsToTry = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  const modelsToTry = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-flash-latest'];
 
   const systemPrompt = `Você é um planejador especialista em viagens rodoviárias de carro no Brasil e América do Sul.
 Crie ou ajuste roteiros realistas com distâncias em km, tempo de estrada, paradas recomendadas a cada ~3h para descanso/abastecimento, estimativa de pedágios em R$, condições de rodovia e cidades de pernoite.
