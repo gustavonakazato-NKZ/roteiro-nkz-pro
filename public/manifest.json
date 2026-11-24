@@ -1,0 +1,17 @@
+{
+  "name": "Roteiro NKZ Pro",
+  "short_name": "Roteiro NKZ",
+  "description": "Planejador Inteligente de Viagens",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f766e",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
