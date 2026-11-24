@@ -56,7 +56,7 @@ import {
 // CONFIGURAÇÃO DO FIREBASE E CONSTANTES DO APLICATIVO
 // ============================================================================
 
-const APP_VERSION = 'v1.3.5';
+const APP_VERSION = 'v1.3.6';
 const appId = 'roteiro-nkz-pro';
 
 const DEFAULT_FIREBASE_CONFIG = {
@@ -1099,7 +1099,7 @@ export default function App() {
     origin: 'Campo Grande - MS',
     destination: '',
     startDate: '',
-    daysCount: 7,
+    daysCount: '7',
     roundTrip: true,
     preferences: ''
   });
@@ -1894,6 +1894,7 @@ export default function App() {
       setRouteError('Informe a cidade de origem e o destino.');
       return;
     }
+    const safeDays = Math.min(30, Math.max(1, parseInt(routeBuilderForm.daysCount, 10) || 1));
     setRouteLoading(true);
     setRouteError(null);
 
@@ -1901,7 +1902,7 @@ export default function App() {
 - Origem: ${routeBuilderForm.origin}
 - Destino: ${routeBuilderForm.destination}
 - Data de início: ${routeBuilderForm.startDate || 'A definir'}
-- Duração total: ${routeBuilderForm.daysCount} dias
+- Duração total: ${safeDays} dias
 - Tipo: ${routeBuilderForm.roundTrip ? 'Ida e Volta' : 'Somente Ida'}
 - Preferências / Observações: ${routeBuilderForm.preferences || 'Paradas seguras, restaurantes bem avaliados e divisão equilibrada de quilometragem por dia.'}`;
 
@@ -4347,10 +4348,28 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                       <label className="block text-[11px] font-bold text-slate-600 mb-1">Total de Dias</label>
                       <input
                         type="number"
+                        inputMode="numeric"
                         min="1"
                         max="30"
+                        placeholder="Ex: 7"
                         value={routeBuilderForm.daysCount}
-                        onChange={(e) => setRouteBuilderForm((f) => ({ ...f, daysCount: Number(e.target.value) || 1 }))}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          if (raw === '') {
+                            setRouteBuilderForm((f) => ({ ...f, daysCount: '' }));
+                            return;
+                          }
+                          const num = parseInt(raw, 10);
+                          if (!isNaN(num)) {
+                            setRouteBuilderForm((f) => ({ ...f, daysCount: String(Math.min(30, num)) }));
+                          }
+                        }}
+                        onBlur={() => {
+                          const num = parseInt(routeBuilderForm.daysCount, 10);
+                          if (isNaN(num) || num < 1) {
+                            setRouteBuilderForm((f) => ({ ...f, daysCount: '1' }));
+                          }
+                        }}
                         className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
                       />
                     </div>
