@@ -39,7 +39,8 @@ import {
   Copy,
   Radio,
   Eye,
-  EyeOff
+  EyeOff,
+  MoreVertical
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
@@ -56,7 +57,7 @@ import {
 // CONFIGURAÇÃO DO FIREBASE E CONSTANTES DO APLICATIVO
 // ============================================================================
 
-const APP_VERSION = 'v1.3.7';
+const APP_VERSION = 'v1.3.8';
 const appId = 'roteiro-nkz-pro';
 
 const DEFAULT_FIREBASE_CONFIG = {
@@ -1180,6 +1181,10 @@ export default function App() {
   const [exploreFilter, setExploreFilter] = useState('Todos');
   const [balneabilityText, setBalneabilityText] = useState('');
   const [balneabilityLoading, setBalneabilityLoading] = useState(false);
+  const [aiExploreByTrip, setAiExploreByTrip] = useState({});
+  const [aiExploreLoading, setAiExploreLoading] = useState(false);
+  const [aiExploreError, setAiExploreError] = useState('');
+  const [showHeaderMenu, setShowHeaderMenu] = useState(false);
 
   // Comboio (Radar em Tempo Real)
   const [convoyRoom, setConvoyRoom] = useState('NKZ-2027');
@@ -1250,6 +1255,12 @@ export default function App() {
       setConvoyVehicleName(currentUser.name || currentUser.username);
     }
   }, [currentUser, convoyVehicleName]);
+
+  // Reinicia filtro do Explorar e fecha menu ao trocar de viagem
+  useEffect(() => {
+    setExploreFilter('Todos');
+    setAiExploreError('');
+  }, [activeTripId]);
 
   // ============================================================================
   // CÁLCULOS AUTOMÁTICOS (VIAGEM ATIVA, COMBUSTÍVEL, ORÇAMENTO E CHECKLIST)
@@ -2269,6 +2280,95 @@ ${JSON.stringify(draftTrip)}`;
     }
   };
 
+  // Descobre pontos de interesse reais ao longo da rota ativa usando o Gemini
+  const handleDiscoverRouteSpots = async () => {
+    if (!activeTrip) return;
+    setAiExploreLoading(true);
+    setAiExploreError('');
+
+    try {
+      const routeCities = Array.from(
+        new Set(
+          (activeTrip.days || [])
+            .flatMap((d) => [d.subtitle, ...(d.stops || []).map((s) => s.route)])
+            .filter(Boolean)
+        )
+      )
+        .slice(0, 14)
+        .join(', ');
+
+      const promptText = `Você é um guia turístico rodoviário do Brasil.
+Liste 6 pontos de interesse reais, restaurantes típicos, mirantes ou atrações ao longo da viagem "${activeTrip.name}" (${activeTrip.dateLabel}).
+Cidades e trechos da rota: ${routeCities || activeTrip.name}.
+Responda EXCLUSIVAMENTE com um JSON válido neste formato (sem markdown e sem texto fora do JSON):
+{
+  "spots": [
+    {
+      "city": "Nome da Cidade",
+      "category": "Atração / Restaurante / Natureza / Parada",
+      "name": "Nome do Local",
+      "desc": "Descrição curta e prática do porquê vale a pena conhecer",
+      "mapsQuery": "Nome do Local Cidade Estado"
+    }
+  ]
+}`;
+
+      const res = await callGeminiCopilot({
+        apiKey: effectiveGeminiApiKey,
+        useSearch: false,
+        systemPrompt:
+          'Responda somente com JSON válido contendo a chave "spots" (array de objetos com city, category, name, desc, mapsQuery).',
+        userPrompt: promptText
+      });
+
+      if (!res.ok) {
+        setAiExploreError(res.error);
+        return;
+      }
+
+      const cleaned = res.text
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+
+      const firstBrace = cleaned.indexOf('{');
+      const lastBrace = cleaned.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        const parsed = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+        if (Array.isArray(parsed?.spots) && parsed.spots.length > 0) {
+          const normalizedSpots = parsed.spots.map((sp, idx) => ({
+            id: `ai-spot-${activeTrip.id}-${idx}-${Date.now()}`,
+            city: String(sp.city || activeTrip.name),
+            category: String(sp.category || 'Sugestão IA'),
+            name: String(sp.name || `Ponto ${idx + 1}`),
+            desc: String(sp.desc || ''),
+            mapsQuery: String(sp.mapsQuery || `${sp.name || ''} ${sp.city || ''}`),
+            isAiSuggestion: true
+          }));
+          setAiExploreByTrip((prev) => ({
+            ...prev,
+            [activeTrip.id]: { spots: normalizedSpots, rawText: '' }
+          }));
+          setExploreFilter('Sugestões IA');
+          showToast(`Pontos de interesse encontrados para ${activeTrip.name}!`);
+          return;
+        }
+      }
+
+      // Fallback caso o Gemini responda em texto livre
+      setAiExploreByTrip((prev) => ({
+        ...prev,
+        [activeTrip.id]: { spots: [], rawText: res.text }
+      }));
+      showToast('Dicas da rota carregadas!');
+    } catch (err) {
+      setAiExploreError(err?.message || 'Não foi possível interpretar os pontos de interesse.');
+    } finally {
+      setAiExploreLoading(false);
+    }
+  };
+
   const handleJoinConvoy = async () => {
     const cleanRoom = convoyRoom.trim().toUpperCase().replace(/[^A-Z0-9-_]/g, '');
     if (!cleanRoom) {
@@ -3062,83 +3162,195 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
   );
 
   const renderExplorarTab = () => {
-    const cities = ['Todos', 'Itapema', 'Bombinhas', 'Balneário Camboriú', 'Porto Belo'];
+    if (!activeTrip) {
+      return (
+        <div className="bg-white rounded-3xl p-6 text-center shadow-sm border border-slate-200/90 space-y-3">
+          <div className="w-12 h-12 mx-auto rounded-2xl bg-teal-50 text-teal-700 flex items-center justify-center">
+            <Compass className="w-6 h-6" />
+          </div>
+          <h2 className="text-sm font-extrabold text-slate-900">Selecione ou crie uma viagem</h2>
+          <p className="text-xs text-slate-500">
+            Os pontos de interesse, paradas e buscas desta aba acompanham automaticamente a rota selecionada.
+          </p>
+        </div>
+      );
+    }
+
+    const tripTextBlob = `${activeTrip.id || ''} ${activeTrip.name || ''} ${(activeTrip.days || [])
+      .map((d) => `${d.subtitle || ''} ${(d.stops || []).map((s) => s.route).join(' ')}`)
+      .join(' ')}`.toLowerCase();
+
+    const isScCoastTrip =
+      activeTrip.id === 'cg-itapema-2027' ||
+      /itapema|bombinhas|balne[aá]rio cambori[uú]|porto belo|florian[oó]polis|penha|meia praia/.test(
+        tripTextBlob
+      );
+
+    // Pontos extraídos diretamente da rota ativa
+    const routeSpots = (activeTrip.days || []).flatMap((d) =>
+      (d.stops || []).map((s) => ({
+        id: `route-spot-${d.day}-${s.id}`,
+        city: `Dia ${d.day}`,
+        dayLabel: d.label || `Dia ${d.day}`,
+        category: s.stopType || 'Parada',
+        name: s.route,
+        desc: [s.activity, s.roadInfo].filter(Boolean).join(' • '),
+        mapsQuery: s.mapsQuery || s.route,
+        isAiSuggestion: false
+      }))
+    );
+
+    const aiTripData = aiExploreByTrip[activeTrip.id] || { spots: [], rawText: '' };
+    const aiSpots = aiTripData.spots || [];
+
+    // Combina pontos da rota ativa (e os clássicos do litoral SC apenas quando a rota for do litoral SC)
+    const baseSpots =
+      activeTrip.id === 'cg-itapema-2027'
+        ? [...aiSpots, ...EXPLORE_SPOTS]
+        : [...aiSpots, ...routeSpots];
+
+    const filterOptions = ['Todos'];
+    if (aiSpots.length > 0) filterOptions.push('Sugestões IA');
+    Array.from(new Set(baseSpots.filter((s) => !s.isAiSuggestion).map((s) => s.city))).forEach(
+      (grp) => {
+        if (!filterOptions.includes(grp)) filterOptions.push(grp);
+      }
+    );
+
     const filteredSpots =
       exploreFilter === 'Todos'
-        ? EXPLORE_SPOTS
-        : EXPLORE_SPOTS.filter((s) => s.city === exploreFilter);
+        ? baseSpots
+        : exploreFilter === 'Sugestões IA'
+        ? aiSpots
+        : baseSpots.filter((s) => !s.isAiSuggestion && s.city === exploreFilter);
+
+    const fallbackMapsLocation =
+      currentDayData?.stops?.[currentDayData.stops.length - 1]?.mapsQuery ||
+      currentDayData?.subtitle ||
+      activeTrip.name;
 
     return (
       <div className="space-y-4 pb-6">
-        {/* Card Balneabilidade IMA-SC com Gemini */}
-        <div className="bg-gradient-to-br from-sky-900 to-teal-900 text-white rounded-2xl p-4 shadow-md space-y-3">
-          <div className="flex items-start justify-between gap-2">
+        {/* Card Guia Inteligente da Rota Ativa */}
+        <div className="bg-gradient-to-br from-teal-900 via-slate-900 to-teal-950 text-white rounded-2xl p-4 shadow-md space-y-3">
+          <div>
+            <div className="text-[11px] font-bold uppercase text-teal-300 flex items-center gap-1">
+              <Compass className="w-3.5 h-3.5" />
+              Explorando a Rota Ativa
+            </div>
+            <h2 className="text-sm font-extrabold mt-0.5">{activeTrip.name}</h2>
+            <p className="text-[11px] text-slate-300 mt-0.5">
+              Veja os pontos do seu roteiro ou peça ao Gemini sugestões de atrações, restaurantes e paradas nesta rota.
+            </p>
+          </div>
+
+          <button
+            onClick={handleDiscoverRouteSpots}
+            disabled={aiExploreLoading}
+            className="w-full py-2.5 rounded-xl bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-slate-950 font-extrabold text-xs flex items-center justify-center gap-1.5 transition"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            {aiExploreLoading
+              ? `Buscando pontos em ${activeTrip.name}...`
+              : aiSpots.length > 0
+              ? 'Atualizar Sugestões IA desta Rota'
+              : 'Descobrir Pontos de Interesse na Rota (IA)'}
+          </button>
+
+          {aiExploreError && (
+            <div className="bg-rose-950/60 border border-rose-400/40 rounded-xl p-2.5 text-[11px] text-rose-100">
+              {aiExploreError}
+            </div>
+          )}
+
+          {aiTripData.rawText && (
+            <div className="bg-slate-950/40 border border-white/15 rounded-xl p-3 text-xs text-slate-100 whitespace-pre-wrap leading-relaxed">
+              {aiTripData.rawText}
+            </div>
+          )}
+        </div>
+
+        {/* Card Balneabilidade IMA-SC (Exibido apenas para rotas no Litoral de SC) */}
+        {isScCoastTrip && (
+          <div className="bg-gradient-to-br from-sky-900 to-teal-900 text-white rounded-2xl p-4 shadow-md space-y-3">
             <div>
               <div className="text-[11px] font-bold uppercase text-sky-200 flex items-center gap-1">
                 <Waves className="w-3.5 h-3.5" />
                 Balneabilidade IMA-SC
               </div>
-              <h2 className="text-sm font-extrabold mt-0.5">Qualidade da Água nas Praias</h2>
+              <h2 className="text-sm font-extrabold mt-0.5">Qualidade da Água nas Praias de SC</h2>
               <p className="text-[11px] text-sky-100/80 mt-0.5">
                 Consulte recomendações rápidas com IA ou abra o mapa oficial do IMA-SC.
               </p>
             </div>
-          </div>
 
-          <div className="flex gap-2">
-            <button
-              onClick={handleCheckBalneability}
-              disabled={balneabilityLoading}
-              className="flex-1 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              {balneabilityLoading ? 'Consultando...' : 'Consultar com Gemini'}
-            </button>
-            <button
-              onClick={() => window.open('https://balneabilidade.ima.sc.gov.br/', '_blank', 'noopener,noreferrer')}
-              className="px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white font-bold text-xs transition"
-            >
-              Site IMA-SC
-            </button>
-          </div>
-
-          {balneabilityText && (
-            <div className="bg-slate-950/40 border border-white/15 rounded-xl p-3 text-xs text-sky-50 whitespace-pre-wrap leading-relaxed">
-              {balneabilityText}
+            <div className="flex gap-2">
+              <button
+                onClick={handleCheckBalneability}
+                disabled={balneabilityLoading}
+                className="flex-1 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                {balneabilityLoading ? 'Consultando...' : 'Consultar com Gemini'}
+              </button>
+              <button
+                onClick={() => window.open('https://balneabilidade.ima.sc.gov.br/', '_blank', 'noopener,noreferrer')}
+                className="px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white font-bold text-xs transition"
+              >
+                Site IMA-SC
+              </button>
             </div>
-          )}
-        </div>
 
-        {/* Busca Rápida ao Redor do GPS */}
+            {balneabilityText && (
+              <div className="bg-slate-950/40 border border-white/15 rounded-xl p-3 text-xs text-sky-50 whitespace-pre-wrap leading-relaxed">
+                {balneabilityText}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Busca Rápida ao Redor do GPS ou da Rota Ativa */}
         <div className="bg-white rounded-2xl p-3.5 shadow-sm border border-slate-200/90 space-y-2.5">
           <div className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
             <Search className="w-3.5 h-3.5 text-teal-700" />
-            Buscar Perto de Mim Agora (Google Maps)
+            Buscar Perto {gps.lat ? 'do Meu GPS' : `de ${activeTrip.name}`} (Maps)
           </div>
           <div className="grid grid-cols-2 gap-2">
             <button
-              onClick={() => openGoogleMaps('gas', gps.lat ? `${gps.lat},${gps.lng}` : activeTrip?.name || 'posto')}
+              onClick={() => openGoogleMaps('gas', gps.lat ? `${gps.lat},${gps.lng}` : fallbackMapsLocation)}
               className="py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center justify-center gap-1.5"
             >
               <Fuel className="w-3.5 h-3.5 text-teal-700" />
               Postos Próximos
             </button>
             <button
-              onClick={() => openGoogleMaps('food', gps.lat ? `${gps.lat},${gps.lng}` : activeTrip?.name || 'restaurante')}
+              onClick={() => openGoogleMaps('food', gps.lat ? `${gps.lat},${gps.lng}` : fallbackMapsLocation)}
               className="py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center justify-center gap-1.5"
             >
               <Utensils className="w-3.5 h-3.5 text-teal-700" />
               Restaurantes
             </button>
             <button
-              onClick={() => openGoogleMaps('search', 'farmacia 24h')}
+              onClick={() =>
+                openGoogleMaps(
+                  'search',
+                  gps.lat ? `farmacia 24h perto de ${gps.lat},${gps.lng}` : `farmacia 24h ${fallbackMapsLocation}`
+                )
+              }
               className="py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center justify-center gap-1.5"
             >
               <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
               Farmácias 24h
             </button>
             <button
-              onClick={() => openGoogleMaps('search', 'borracharia mecanica')}
+              onClick={() =>
+                openGoogleMaps(
+                  'search',
+                  gps.lat
+                    ? `borracharia mecanica perto de ${gps.lat},${gps.lng}`
+                    : `borracharia mecanica ${fallbackMapsLocation}`
+                )
+              }
               className="py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center justify-center gap-1.5"
             >
               <Car className="w-3.5 h-3.5 text-slate-700" />
@@ -3147,45 +3359,68 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
           </div>
         </div>
 
-        {/* Filtros de Pontos Turísticos */}
-        <div className="flex gap-1.5 overflow-x-auto pb-1 no-scrollbar">
-          {cities.map((c) => (
-            <button
-              key={c}
-              onClick={() => setExploreFilter(c)}
-              className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border transition ${
-                exploreFilter === c
-                  ? 'bg-teal-800 border-teal-800 text-white'
-                  : 'bg-white border-slate-200 text-slate-600'
-              }`}
-            >
-              {c}
-            </button>
-          ))}
-        </div>
+        {/* Filtros Dinâmicos de Pontos da Rota */}
+        {filterOptions.length > 1 && (
+          <div className="flex gap-1.5 overflow-x-auto pb-1 no-scrollbar">
+            {filterOptions.map((opt) => (
+              <button
+                key={opt}
+                onClick={() => setExploreFilter(opt)}
+                className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-bold border transition ${
+                  exploreFilter === opt
+                    ? 'bg-teal-800 border-teal-800 text-white'
+                    : 'bg-white border-slate-200 text-slate-600'
+                }`}
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+        )}
 
-        {/* Lista de Pontos */}
+        {/* Lista de Pontos de Interesse da Rota Ativa */}
         <div className="space-y-2.5">
-          {filteredSpots.map((spot) => (
-            <div key={spot.id} className="bg-white rounded-2xl p-3.5 shadow-sm border border-slate-200/80 space-y-2">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <span className="text-[10px] font-bold uppercase text-teal-700">
-                    {spot.city} • {spot.category}
-                  </span>
-                  <h3 className="text-sm font-extrabold text-slate-900">{spot.name}</h3>
-                </div>
-                <button
-                  onClick={() => openGoogleMaps('route', spot.mapsQuery)}
-                  className="shrink-0 px-2.5 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-[11px] font-bold flex items-center gap-1"
-                >
-                  <Navigation className="w-3 h-3" />
-                  Ir
-                </button>
-              </div>
-              <p className="text-xs text-slate-600">{spot.desc}</p>
+          <div className="text-xs font-extrabold text-slate-700 px-1">
+            Pontos na Rota ({filteredSpots.length})
+          </div>
+          {filteredSpots.length === 0 ? (
+            <div className="bg-white rounded-2xl p-4 text-center text-xs text-slate-500 border border-slate-200/80">
+              Nenhum ponto encontrado neste filtro. Toque em <strong>Descobrir Pontos de Interesse (IA)</strong> acima.
             </div>
-          ))}
+          ) : (
+            filteredSpots.map((spot) => (
+              <div
+                key={spot.id}
+                className={`bg-white rounded-2xl p-3.5 shadow-sm border space-y-2 ${
+                  spot.isAiSuggestion ? 'border-amber-200 bg-amber-50/20' : 'border-slate-200/80'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] font-bold uppercase text-teal-700">
+                        {spot.city} • {spot.category}
+                      </span>
+                      {spot.isAiSuggestion && (
+                        <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                          IA
+                        </span>
+                      )}
+                    </div>
+                    <h3 className="text-sm font-extrabold text-slate-900 mt-0.5">{spot.name}</h3>
+                  </div>
+                  <button
+                    onClick={() => openGoogleMaps('route', spot.mapsQuery)}
+                    className="shrink-0 px-2.5 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-[11px] font-bold flex items-center gap-1"
+                  >
+                    <Navigation className="w-3 h-3" />
+                    Ir
+                  </button>
+                </div>
+                {spot.desc && <p className="text-xs text-slate-600 leading-relaxed">{spot.desc}</p>}
+              </div>
+            ))
+          )}
         </div>
       </div>
     );
@@ -4191,73 +4426,117 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
         {/* Cabeçalho */}
         <header className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200/80 px-4 pt-3 pb-2.5 space-y-2">
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0 flex-1">
               <div className="w-9 h-9 rounded-2xl bg-gradient-to-br from-teal-700 to-slate-900 text-white flex items-center justify-center shrink-0 shadow-sm">
                 <Car className="w-5 h-5 text-amber-400" />
               </div>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
-                  <h1 className="text-sm font-extrabold text-slate-900 truncate">Roteiro NKZ Pro</h1>
+                  <h1 className="text-sm font-extrabold text-slate-900">Roteiro NKZ Pro</h1>
                   {cloudStatus === 'synced' ? (
                     <Cloud className="w-3.5 h-3.5 text-emerald-600 shrink-0" title="Firebase Conectado" />
                   ) : (
                     <CloudOff className="w-3.5 h-3.5 text-amber-500 shrink-0" title="Modo Local" />
                   )}
+                  <span className="text-[10px] font-bold text-slate-400 ml-auto">{APP_VERSION}</span>
                 </div>
-                <p className="text-[12px] text-slate-600 font-semibold leading-snug truncate">
-                  {activeTrip ? `${activeTrip.name} • ${activeTrip.dateLabel}` : 'Sem viagem ativa'}
-                </p>
+                <div className="flex items-center gap-1 text-[11px] text-slate-500 truncate">
+                  <User className="w-3 h-3 text-teal-700 shrink-0" />
+                  <span className="font-bold text-slate-700 truncate">{currentUser.name}</span>
+                  <span className="truncate">(@{currentUser.username})</span>
+                  {currentUser.role === 'admin' && (
+                    <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-extrabold text-[9px] shrink-0">
+                      ADMIN
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5 shrink-0">
-              {currentUser.role === 'admin' && (
-                <button
-                  onClick={() => setShowAdminModal(true)}
-                  className="p-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200/80 transition"
-                  title="Painel Admin"
-                >
-                  <Shield className="w-4 h-4" />
-                </button>
-              )}
+            {/* Menu Agrupado nos 3 Pontinhos Verticais */}
+            <div className="relative shrink-0">
               <button
-                onClick={handleOpenNewRouteCreator}
-                className="px-2.5 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-extrabold flex items-center gap-1 transition"
-                title="Criar Nova Rota com IA"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                IA
-              </button>
-              <button
-                onClick={() => setShowSettings(true)}
+                onClick={() => setShowHeaderMenu((v) => !v)}
                 className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
-                title="Configurações"
+                title="Menu de ações"
+                aria-label="Abrir menu de ações"
               >
-                <Settings className="w-4 h-4" />
+                <MoreVertical className="w-5 h-5" />
               </button>
-              <button
-                onClick={handleLogout}
-                className="p-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 transition"
-                title="Sair"
-              >
-                <LogOut className="w-4 h-4" />
-              </button>
+
+              {showHeaderMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setShowHeaderMenu(false)}
+                  />
+                  <div className="absolute right-0 mt-2 w-52 bg-white rounded-2xl shadow-xl border border-slate-200 py-1.5 z-50">
+                    <button
+                      onClick={() => {
+                        setShowHeaderMenu(false);
+                        handleOpenNewRouteCreator();
+                      }}
+                      className="w-full px-3.5 py-2.5 text-left text-xs font-bold text-teal-800 hover:bg-teal-50 flex items-center gap-2.5"
+                    >
+                      <Plus className="w-4 h-4 text-teal-700" />
+                      Nova Rota com IA
+                    </button>
+
+                    {currentUser.role === 'admin' && (
+                      <button
+                        onClick={() => {
+                          setShowHeaderMenu(false);
+                          setShowAdminModal(true);
+                        }}
+                        className="w-full px-3.5 py-2.5 text-left text-xs font-bold text-amber-800 hover:bg-amber-50 flex items-center gap-2.5"
+                      >
+                        <Shield className="w-4 h-4 text-amber-600" />
+                        Painel Admin
+                      </button>
+                    )}
+
+                    <button
+                      onClick={() => {
+                        setShowHeaderMenu(false);
+                        setShowSettings(true);
+                      }}
+                      className="w-full px-3.5 py-2.5 text-left text-xs font-bold text-slate-700 hover:bg-slate-50 flex items-center gap-2.5"
+                    >
+                      <Settings className="w-4 h-4 text-slate-500" />
+                      Configurações
+                    </button>
+
+                    <div className="my-1 border-t border-slate-100" />
+
+                    <button
+                      onClick={() => {
+                        setShowHeaderMenu(false);
+                        handleLogout();
+                      }}
+                      className="w-full px-3.5 py-2.5 text-left text-xs font-bold text-rose-600 hover:bg-rose-50 flex items-center gap-2.5"
+                    >
+                      <LogOut className="w-4 h-4 text-rose-500" />
+                      Sair da Conta
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
 
-          {/* Barra Compacta de Usuário Logado e Versão */}
-          <div className="flex items-center justify-between pt-1.5 border-t border-slate-100 text-[11px]">
+          {/* Barra Dedicada da Rota Selecionada no Momento (Leitura Completa) */}
+          <div className="flex items-center justify-between gap-2 bg-teal-50/80 border border-teal-200/70 rounded-xl px-3 py-1.5">
             <div className="flex items-center gap-1.5 min-w-0">
-              <User className="w-3.5 h-3.5 text-teal-700 shrink-0" />
-              <span className="font-bold text-slate-800 truncate">{currentUser.name}</span>
-              <span className="text-slate-400 truncate">(@{currentUser.username})</span>
-              {currentUser.role === 'admin' && (
-                <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-extrabold text-[9px]">
-                  ADMIN
-                </span>
-              )}
+              <Route className="w-3.5 h-3.5 text-teal-700 shrink-0" />
+              <span className="text-xs font-extrabold text-teal-950 leading-snug">
+                {activeTrip ? activeTrip.name : 'Sem viagem ativa'}
+              </span>
             </div>
-            <span className="font-bold text-slate-400 shrink-0">{APP_VERSION}</span>
+            {activeTrip?.dateLabel && (
+              <span className="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-lg bg-white text-teal-800 border border-teal-200/70">
+                {activeTrip.dateLabel}
+              </span>
+            )}
           </div>
         </header>
 
