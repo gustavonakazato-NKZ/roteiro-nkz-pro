@@ -72,7 +72,7 @@ let fbApp = null;
 let fbAuth = null;
 let fbDb = null;
 const appId = 'roteiro-nkz-pro';
-const APP_VERSION = 'v1.2.0';
+const APP_VERSION = 'v1.2.1';
 
 try {
   let firebaseConfig = DEFAULT_FIREBASE_CONFIG;
@@ -1024,7 +1024,7 @@ function usePersistentState(key, initialValue) {
 // INTEGRAÇÃO COM GEMINI (COPILOTO DE ESTRADA + CRIADOR DE ROTAS + IMA-SC)
 // ============================================================================
 
-async function fetchWithBackoff(url, options, maxRetries = 3) {
+async function fetchWithBackoff(url, options, maxRetries = 2) {
   let delay = 1000;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const response = await fetch(url, options);
@@ -1034,44 +1034,78 @@ async function fetchWithBackoff(url, options, maxRetries = 3) {
       delay *= 2;
       continue;
     }
-    throw new Error(`HTTP ${response.status}`);
+    let detail = `HTTP ${response.status}`;
+    try {
+      const errJson = await response.json();
+      if (errJson?.error?.message) {
+        detail = `${response.status}: ${errJson.error.message}`;
+      }
+    } catch (e) {}
+    throw new Error(detail);
   }
 }
 
 async function callGeminiCopilot({ userPrompt, systemPrompt, customApiKey }) {
   const apiKey = (customApiKey || '').trim();
-  const model = 'gemini-3-flash-preview';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  if (!apiKey) {
+    throw new Error('Chave API do Gemini não informada nas Configurações.');
+  }
 
-  const response = await fetchWithBackoff(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      tools: [{ google_search: {} }]
-    })
-  });
+  // Tenta modelos estáveis com e sem Google Search (evita bloqueios na camada gratuita)
+  const attempts = [
+    { model: 'gemini-2.5-flash', useSearch: true },
+    { model: 'gemini-2.5-flash', useSearch: false },
+    { model: 'gemini-2.5-flash-lite', useSearch: false }
+  ];
 
-  const data = await response.json();
-  const candidate = data?.candidates?.[0];
-  const text =
-    candidate?.content?.parts?.map((p) => p.text).filter(Boolean).join('\n') ||
-    'Não foi possível obter resposta do Gemini agora.';
+  let lastError = null;
+  for (const cfg of attempts) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const body = {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: userPrompt }] }]
+      };
+      if (cfg.useSearch) {
+        body.tools = [{ google_search: {} }];
+      }
 
-  const groundingChunks = candidate?.groundingMetadata?.groundingChunks || [];
-  const sources = groundingChunks
-    .map((c) => c.web)
-    .filter((w) => w && w.uri)
-    .slice(0, 4);
+      const response = await fetchWithBackoff(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify(body)
+      });
 
-  return { text, sources };
+      const data = await response.json();
+      const candidate = data?.candidates?.[0];
+      const text =
+        candidate?.content?.parts?.map((p) => p.text).filter(Boolean).join('\n') ||
+        'Não foi possível obter resposta do Gemini agora.';
+
+      const groundingChunks = candidate?.groundingMetadata?.groundingChunks || [];
+      const sources = groundingChunks
+        .map((c) => c.web)
+        .filter((w) => w && w.uri)
+        .slice(0, 4);
+
+      return { text, sources };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Falha ao consultar o Gemini.');
 }
 
 async function callGeminiRouteBuilder({ form, currentDraft, adjustmentPrompt, customApiKey, defaultDailyRate }) {
   const apiKey = (customApiKey || '').trim();
-  const model = 'gemini-3-flash-preview';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  if (!apiKey) {
+    throw new Error('Chave API do Gemini não informada nas Configurações.');
+  }
+  const modelsToTry = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
 
   const systemPrompt = `Você é um planejador especialista em viagens rodoviárias de carro no Brasil e América do Sul.
 Crie ou ajuste roteiros realistas com distâncias em km, tempo de estrada, paradas recomendadas a cada ~3h para descanso/abastecimento, estimativa de pedágios em R$, condições de rodovia e cidades de pernoite.
@@ -1174,23 +1208,36 @@ Regras:
     required: ['name', 'dateLabel', 'summary', 'totalKm', 'totalTolls', 'lodgingCities', 'days']
   };
 
-  const response = await fetchWithBackoff(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema
-      }
-    })
-  });
+  let lastError = null;
+  for (const model of modelsToTry) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const response = await fetchWithBackoff(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            responseSchema
+          }
+        })
+      });
 
-  const data = await response.json();
-  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!rawText) throw new Error('Resposta vazia do Gemini');
-  return JSON.parse(rawText);
+      const data = await response.json();
+      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!rawText) throw new Error('Resposta vazia do Gemini');
+      return JSON.parse(rawText);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Falha ao gerar rota com o Gemini.');
 }
 
 // Renderizador leve de texto formatado (**negrito** e listas)
@@ -1299,6 +1346,9 @@ export default function App() {
   const [showPasswordChange, setShowPasswordChange] = useState(false);
   const [passwordForm, setPasswordForm] = useState({ current: '', next: '', confirm: '' });
   const [tripToDelete, setTripToDelete] = useState(null);
+  const [globalGeminiKey, setGlobalGeminiKey] = usePersistentState('rp_global_gemini_key_v1', '');
+  const [globalKeyInput, setGlobalKeyInput] = useState('');
+  const [savingGlobalKey, setSavingGlobalKey] = useState(false);
   const [cloudStatus, setCloudStatus] = useState(fbDb ? 'connecting' : 'offline');
   const [customFbConfigInput, setCustomFbConfigInput] = useState(() => {
     try {
@@ -1387,6 +1437,9 @@ export default function App() {
     () => activeDays.find((d) => d.day === selectedDay) || activeDays[0] || ITINERARY_DAYS[0],
     [activeDays, selectedDay]
   );
+
+  // Chave efetiva do Gemini: prioriza a chave global definida pelo Admin no Firebase
+  const effectiveGeminiApiKey = (globalGeminiKey || params.geminiApiKey || '').trim();
 
   // Auto-scroll do chat do Copiloto IA
   useEffect(() => {
@@ -1571,6 +1624,25 @@ export default function App() {
       () => {
         setCloudStatus('offline');
       }
+    );
+    return () => unsub();
+  }, [fbUser]);
+
+  // Sincronização em tempo real das configurações globais (Chave Gemini compartilhada)
+  useEffect(() => {
+    if (!fbDb || !fbUser) return;
+    const globalRef = doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_settings', 'global');
+    const unsub = onSnapshot(
+      globalRef,
+      (docSnap) => {
+        if (!docSnap.exists()) return;
+        const data = docSnap.data();
+        if (data && typeof data.geminiApiKey === 'string') {
+          setGlobalGeminiKey(data.geminiApiKey);
+          setGlobalKeyInput(data.geminiApiKey);
+        }
+      },
+      () => {}
     );
     return () => unsub();
   }, [fbUser]);
@@ -1981,6 +2053,35 @@ export default function App() {
     }
   };
 
+  const handleSaveGlobalGeminiKey = async () => {
+    if (currentUser?.role !== 'admin') return;
+    const keyToSave = globalKeyInput.trim();
+    setSavingGlobalKey(true);
+    try {
+      if (fbDb && fbUser) {
+        await setDoc(
+          doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_settings', 'global'),
+          {
+            geminiApiKey: keyToSave,
+            updatedAt: new Date().toISOString(),
+            updatedBy: currentUser.username
+          },
+          { merge: true }
+        );
+      }
+      setGlobalGeminiKey(keyToSave);
+      showToast(
+        keyToSave
+          ? 'Chave Gemini salva e atualizada para todos os usuários!'
+          : 'Chave Gemini global removida.'
+      );
+    } catch (e) {
+      showToast('Erro ao salvar chave global no Firebase.', 'error');
+    } finally {
+      setSavingGlobalKey(false);
+    }
+  };
+
   // ============================================================================
   // AÇÕES DO CRIADOR E AJUSTADOR DE ROTAS COM GEMINI
   // ============================================================================
@@ -2039,13 +2140,13 @@ export default function App() {
     try {
       const result = await callGeminiRouteBuilder({
         form: routeForm,
-        customApiKey: params.geminiApiKey,
+        customApiKey: effectiveGeminiApiKey,
         defaultDailyRate: params.lodgingAvgNight
       });
       setDraftTrip(result);
       showToast('Rota criada pelo Gemini! Revise ou peça ajustes.');
     } catch (err) {
-      setRouteError('Não foi possível gerar a rota agora. Verifique sua chave API do Gemini nas Configurações.');
+      setRouteError(`Erro do Gemini: ${err?.message || 'verifique sua chave API nas Configurações.'}`);
     } finally {
       setRouteGenerating(false);
     }
@@ -2059,14 +2160,14 @@ export default function App() {
       const result = await callGeminiRouteBuilder({
         currentDraft: draftTrip,
         adjustmentPrompt: adjustmentText.trim(),
-        customApiKey: params.geminiApiKey,
+        customApiKey: effectiveGeminiApiKey,
         defaultDailyRate: params.lodgingAvgNight
       });
       setDraftTrip(result);
       setAdjustmentText('');
       showToast('Rota ajustada pelo Gemini!');
     } catch (err) {
-      setRouteError('Não foi possível aplicar o ajuste agora. Tente novamente.');
+      setRouteError(`Erro do Gemini: ${err?.message || 'tente novamente.'}`);
     } finally {
       setRouteGenerating(false);
     }
@@ -2210,7 +2311,7 @@ export default function App() {
       const res = await callGeminiCopilot({
         userPrompt,
         systemPrompt,
-        customApiKey: params.geminiApiKey
+        customApiKey: effectiveGeminiApiKey
       });
       const nowLabel = `${new Date().toLocaleDateString('pt-BR')} ${getCurrentHHMM()}`;
       setWaterSummary({ text: res.text, updatedAt: nowLabel });
@@ -2352,7 +2453,7 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
       const res = await callGeminiCopilot({
         userPrompt: text,
         systemPrompt,
-        customApiKey: params.geminiApiKey
+        customApiKey: effectiveGeminiApiKey
       });
       setChatMessages((prev) => [...prev, { role: 'assistant', text: res.text, sources: res.sources || [] }]);
     } catch (err) {
@@ -2360,7 +2461,7 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
         ...prev,
         {
           role: 'assistant',
-          text: 'Não consegui consultar o Gemini agora. Verifique sua conexão ou informe sua **Chave API do Gemini** em **Configurações** (ícone de engrenagem no topo).',
+          text: `Não consegui consultar o Gemini agora.\n**Detalhe técnico:** ${err?.message || 'verifique sua conexão ou sua Chave API do Gemini nas Configurações.'}`,
           sources: []
         }
       ]);
@@ -4546,13 +4647,43 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                   <label className="block text-xs font-bold text-slate-700 mb-1">
                     Chave API do Gemini (Google AI Studio)
                   </label>
-                  <input
-                    type="password"
-                    placeholder="Cole sua Gemini API Key aqui..."
-                    value={params.geminiApiKey}
-                    onChange={(e) => setParams((p) => ({ ...p, geminiApiKey: e.target.value }))}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
-                  />
+                  {globalGeminiKey ? (
+                    <div className="mb-2 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-[11px] font-semibold text-emerald-800 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span>Chave Global do Administrador ativa para todos os usuários.</span>
+                    </div>
+                  ) : null}
+                  {currentUser?.role === 'admin' ? (
+                    <div className="space-y-2">
+                      <input
+                        type="password"
+                        placeholder="Cole a Gemini API Key global para todos os usuários..."
+                        value={globalKeyInput}
+                        onChange={(e) => setGlobalKeyInput(e.target.value)}
+                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleSaveGlobalGeminiKey}
+                        disabled={savingGlobalKey}
+                        className="w-full py-2 rounded-xl bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-bold transition"
+                      >
+                        {savingGlobalKey ? 'Salvando no Firebase...' : 'Salvar Chave para Todos os Usuários'}
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      type="password"
+                      placeholder={
+                        globalGeminiKey
+                          ? 'Opcional (chave global já está ativa)'
+                          : 'Cole sua Gemini API Key aqui...'
+                      }
+                      value={params.geminiApiKey}
+                      onChange={(e) => setParams((p) => ({ ...p, geminiApiKey: e.target.value }))}
+                      className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
+                    />
+                  )}
                   <p className="text-[10px] text-slate-500 mt-1">
                     Ativa o Copiloto IA, Criador de Rotas e consulta ao vivo de balneabilidade IMA-SC.
                   </p>
@@ -4655,6 +4786,41 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                 >
                   <X className="w-4 h-4" />
                 </button>
+              </div>
+
+              {/* Chave API do Gemini Global (compartilhada com todos os usuários) */}
+              <div className="bg-teal-50/70 border border-teal-200/90 rounded-2xl p-3.5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-teal-950 flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-teal-700" />
+                    Chave Gemini Global (Todos os Usuários)
+                  </span>
+                  {globalGeminiKey && (
+                    <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
+                      Ativa
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-teal-900/80">
+                  Ao salvar aqui, a chave é aplicada automaticamente para todos os logins no Firebase.
+                </p>
+                <div className="flex gap-1.5">
+                  <input
+                    type="password"
+                    placeholder="Cole a chave API do Gemini..."
+                    value={globalKeyInput}
+                    onChange={(e) => setGlobalKeyInput(e.target.value)}
+                    className="flex-1 rounded-xl border border-teal-200 bg-white px-3 py-2 text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveGlobalGeminiKey}
+                    disabled={savingGlobalKey}
+                    className="px-3 py-2 rounded-xl bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-bold shrink-0 transition"
+                  >
+                    {savingGlobalKey ? 'Salvando...' : 'Salvar'}
+                  </button>
+                </div>
               </div>
 
               <form onSubmit={handleCreateUser} className="bg-slate-50 border border-slate-200/90 rounded-2xl p-3.5 space-y-2.5">
