@@ -54,7 +54,7 @@ import {
 // CONFIGURAÇÃO DO FIREBASE E CONSTANTES DO APLICATIVO
 // ============================================================================
 
-const APP_VERSION = 'v1.3.0';
+const APP_VERSION = 'v1.3.2';
 const appId = 'roteiro-nkz-pro';
 
 const DEFAULT_FIREBASE_CONFIG = {
@@ -664,6 +664,35 @@ function getCardinalDirection(lat1, lng1, lat2, lng2) {
   return dirs[Math.round(brng / 45) % 8];
 }
 
+// Normaliza registros de usuários vindos do Firebase ou localStorage (compatível com versões anteriores)
+function normalizeUserRecord(raw, fallbackId) {
+  if (!raw || typeof raw !== 'object') return null;
+  const username = String(raw.username || raw.login || raw.user || fallbackId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, '');
+  if (!username) return null;
+
+  const password =
+    raw.password !== undefined
+      ? String(raw.password)
+      : raw.pass !== undefined
+      ? String(raw.pass)
+      : raw.senha !== undefined
+      ? String(raw.senha)
+      : '';
+
+  return {
+    ...raw,
+    id: raw.id || fallbackId || `user-${username}`,
+    username,
+    name: raw.name || raw.nome || username,
+    password,
+    role: raw.role === 'admin' || raw.isAdmin === true ? 'admin' : 'user',
+    active: raw.active !== false && raw.blocked !== true && raw.status !== 'bloqueado'
+  };
+}
+
 // ============================================================================
 // INTEGRAÇÃO COM A API DO GEMINI (v3.5-flash-lite + FALLBACK AUTOMÁTICO)
 // ============================================================================
@@ -847,7 +876,12 @@ export default function App() {
       const saved = window.localStorage.getItem('rp_users_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const normalized = parsed
+            .map((item, idx) => normalizeUserRecord(item, item?.id || `local-${idx}`))
+            .filter(Boolean);
+          if (normalized.length > 0) return normalized;
+        }
       }
     } catch (e) {}
     return DEFAULT_USERS;
@@ -867,6 +901,8 @@ export default function App() {
 
   // Estado Firebase e Nuvem
   const [fbUser, setFbUser] = useState(null);
+  const [usersLoadedFromCloud, setUsersLoadedFromCloud] = useState(!fbDb);
+  const [cloudError, setCloudError] = useState('');
   const [globalGeminiKey, setGlobalGeminiKey] = useState('');
   const [globalKeyInput, setGlobalKeyInput] = useState('');
   const [savingGlobalKey, setSavingGlobalKey] = useState(false);
@@ -1173,26 +1209,64 @@ export default function App() {
   useEffect(() => {
     if (!fbAuth) {
       setCloudStatus('offline');
+      setUsersLoadedFromCloud(true);
       return;
     }
 
-    const unsub = onAuthStateChanged(fbAuth, (user) => {
+    let cancelled = false;
+    const unsubAuth = onAuthStateChanged(fbAuth, (user) => {
+      if (cancelled) return;
       if (user) {
         setFbUser(user);
+        setCloudError('');
       } else {
-        signInAnonymously(fbAuth).catch(() => {
+        signInAnonymously(fbAuth).catch((err) => {
+          if (cancelled) return;
           setCloudStatus('offline');
+          setUsersLoadedFromCloud(true);
+          setCloudError(err?.message || 'Não foi possível autenticar no Firebase.');
         });
       }
     });
 
-    return () => unsub();
+    return () => {
+      cancelled = true;
+      unsubAuth();
+    };
   }, []);
 
   // Sincronização dos usuários cadastrados no Firestore
   useEffect(() => {
     if (!fbDb || !fbUser) return;
     const usersCol = collection(fbDb, 'artifacts', appId, 'public', 'data', 'app_users');
+
+    const normalizeUserRecord = (raw, fallbackId) => {
+      if (!raw || typeof raw !== 'object') return null;
+      const rawUsername = raw.username ?? raw.login ?? raw.user ?? raw.usuario ?? '';
+      const cleanUsername = String(rawUsername).trim();
+      if (!cleanUsername) return null;
+
+      const rawPwd =
+        raw.password ??
+        raw.pass ??
+        raw.senha ??
+        raw.pwd ??
+        raw.pin ??
+        raw.passwordHash ??
+        '';
+
+      return {
+        ...raw,
+        id: raw.id || fallbackId || `user-${cleanUsername.toLowerCase()}`,
+        username: cleanUsername,
+        name: String(raw.name ?? raw.nome ?? raw.displayName ?? cleanUsername).trim(),
+        password: rawPwd !== undefined && rawPwd !== null ? String(rawPwd) : '',
+        role: raw.role === 'admin' || raw.isAdmin === true || raw.perfil === 'admin' ? 'admin' : 'user',
+        active: raw.active !== false && raw.blocked !== true && raw.status !== 'blocked',
+        _rawKeys: Object.keys(raw)
+      };
+    };
+
     const unsub = onSnapshot(
       usersCol,
       (snap) => {
@@ -1200,22 +1274,44 @@ export default function App() {
           // Semeia o admin padrão no primeiro acesso
           const defaultAdmin = DEFAULT_USERS[0];
           setDoc(doc(fbDb, 'artifacts', appId, 'public', 'data', 'app_users', defaultAdmin.id), defaultAdmin).catch(() => {});
+          setCloudStatus('synced');
+          setUsersLoadedFromCloud(true);
           return;
         }
         const list = [];
+        const seen = new Set();
+
+        const pushNormalized = (item, fallbackId) => {
+          const norm = normalizeUserRecord(item, fallbackId);
+          if (!norm) return;
+          const key = norm.username.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          list.push(norm);
+        };
+
         snap.forEach((docSnap) => {
           const data = docSnap.data();
-          if (data && data.username) {
-            list.push({ id: docSnap.id, ...data });
+          if (!data) return;
+          if (Array.isArray(data.users)) {
+            data.users.forEach((u, idx) => pushNormalized(u, `${docSnap.id}-${idx}`));
+          } else if (Array.isArray(data.list)) {
+            data.list.forEach((u, idx) => pushNormalized(u, `${docSnap.id}-${idx}`));
+          } else {
+            pushNormalized(data, docSnap.id);
           }
         });
+
         if (list.length > 0) {
           setAppUsers(list);
           setCloudStatus('synced');
+          setUsersLoadedFromCloud(true);
         }
       },
-      () => {
+      (err) => {
         setCloudStatus('offline');
+        setUsersLoadedFromCloud(true);
+        setCloudError(err?.message || 'Erro ao carregar usuários do Firebase.');
       }
     );
     return () => unsub();
@@ -1441,14 +1537,56 @@ export default function App() {
   const handleLogin = (e) => {
     e.preventDefault();
     setLoginError('');
-    const uname = loginForm.username.trim().toLowerCase();
+    const uname = loginForm.username.trim().toLowerCase().replace(/^@/, '');
     const pwd = loginForm.password;
+    const pwdTrimmed = pwd.trim();
 
-    const found = appUsers.find((u) => u.username.toLowerCase() === uname && u.password === pwd);
-    if (!found) {
-      setLoginError('Usuário ou senha inválidos.');
+    if (!uname || !pwd) {
+      setLoginError('Informe seu usuário e sua senha.');
       return;
     }
+
+    const found = appUsers.find((u) => String(u.username || '').trim().toLowerCase() === uname);
+    if (!found) {
+      setLoginError(`Usuário "@${uname}" não encontrado entre os ${appUsers.length} cadastros carregados.`);
+      return;
+    }
+
+    let b64Pwd = '';
+    try {
+      b64Pwd = window.btoa(pwd);
+    } catch (err) {}
+
+    const candidatePasswords = [
+      found.password,
+      found.pass,
+      found.senha,
+      found.pwd,
+      found.pin,
+      found.passwordHash
+    ]
+      .filter((v) => v !== undefined && v !== null && String(v).length > 0)
+      .map((v) => String(v));
+
+    const passwordMatches = candidatePasswords.some(
+      (stored) =>
+        stored === pwd ||
+        stored === pwdTrimmed ||
+        stored.trim() === pwdTrimmed ||
+        (b64Pwd && stored === b64Pwd)
+    );
+
+    if (!passwordMatches) {
+      if (candidatePasswords.length === 0) {
+        setLoginError(
+          `O cadastro de @${found.username} no Firebase está sem campo de senha reconhecido (campos encontrados: ${(found._rawKeys || []).join(', ')}).`
+        );
+      } else {
+        setLoginError(`Senha incorreta para @${found.username}. Verifique letras maiúsculas/minúsculas.`);
+      }
+      return;
+    }
+
     if (found.active === false) {
       setLoginError('Este usuário está bloqueado pelo administrador.');
       return;
@@ -2208,7 +2346,7 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
             <div className="flex items-center justify-center">
               <span
                 className={`inline-flex items-center gap-1.5 text-[11px] font-bold px-2.5 py-1 rounded-full ${
-                  cloudStatus === 'synced' || fbUser
+                  cloudStatus === 'synced' && usersLoadedFromCloud
                     ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                     : 'bg-amber-50 text-amber-700 border border-amber-200'
                 }`}
@@ -2216,16 +2354,21 @@ Seja direto, prático e focado em segurança na estrada, horários reais, postos
                 {cloudStatus === 'synced' || fbUser ? (
                   <>
                     <Cloud className="w-3.5 h-3.5" />
-                    Firebase Conectado
+                    Firebase Conectado ({appUsers.length})
                   </>
                 ) : (
                   <>
                     <CloudOff className="w-3.5 h-3.5" />
-                    Conectando nuvem...
+                    {cloudError ? 'Modo Local (offline)' : 'Carregando usuários...'}
                   </>
                 )}
               </span>
             </div>
+            {cloudError && (
+              <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-2.5 py-1.5">
+                {cloudError}
+              </div>
+            )}
           </div>
 
           <form onSubmit={handleLogin} className="space-y-3">
